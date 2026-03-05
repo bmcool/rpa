@@ -7,9 +7,7 @@ from typing import Any, Optional
 from selenium import webdriver
 from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from urllib3.exceptions import NewConnectionError
-from webdriver_manager.chrome import ChromeDriverManager
 
 try:
     from fastapi_app.config import settings
@@ -65,12 +63,9 @@ class MoneyCheckHelper:
         chrome_options.add_argument("--headless")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--disable-software-rasterizer")
         debug_port = random.randint(9222, 9240)
         chrome_options.add_argument(f"--remote-debugging-port={debug_port}")
-        service = Service(ChromeDriverManager().install())
-        return webdriver.Chrome(service=service, options=chrome_options)
+        return webdriver.Chrome(options=chrome_options)
 
     def get_js(self, params: str, action: str = "QUERY") -> str:
         return f"""
