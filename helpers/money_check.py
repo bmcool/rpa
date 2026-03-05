@@ -71,11 +71,11 @@ class MoneyCheckHelper:
                     r = client.post(self.query_url, data=form_data)
                     r.raise_for_status()
                     query_result = r.json()
-                    if query_result is None:
-                        logger.warning("%s query_result is None, retrying", self.query_titles[query_type])
+                    if not isinstance(query_result, dict):
+                        logger.warning("%s query_result is not dict (got %s), retrying", self.query_titles[query_type], type(query_result).__name__)
                         continue
 
-                    page_info = query_result.get("pageInfo", {})
+                    page_info = query_result.get("pageInfo") or {}
                     total_num = page_info.get("totalNum") if isinstance(page_info, dict) else None
                     check_result = (
                         RPAQueryStatus.NORMAL if total_num == 0 else RPAQueryStatus.ABNORMAL
@@ -87,7 +87,7 @@ class MoneyCheckHelper:
                     pdf_result = r.json()
                     pdf_url = pdf_result.get("data") if isinstance(pdf_result, dict) else None
                     if not pdf_url:
-                        logger.warning("%s pdf_url is empty, retrying", self.query_titles[query_type])
+                        logger.warning("%s pdf_url is empty (response: %s), retrying", self.query_titles[query_type], pdf_result)
                         continue
 
                     self.query_result = query_result

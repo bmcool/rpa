@@ -61,8 +61,12 @@ class DomesticJudV2Helper:
                     r = client.post(self.query_url, data=query_form)
                     r.raise_for_status()
                     query_result = r.json()
+                    if not isinstance(query_result, dict):
+                        logger.warning("domestic query_result is not dict (got %s), retrying", type(query_result).__name__)
+                        continue
 
-                    total_num = query_result.get("pageInfo", {}).get("totalNum")
+                    page_info = query_result.get("pageInfo") or {}
+                    total_num = page_info.get("totalNum") if isinstance(page_info, dict) else None
                     check_result = (
                         RPAQueryStatus.NORMAL if total_num == 0 else RPAQueryStatus.ABNORMAL
                     )
@@ -73,7 +77,7 @@ class DomesticJudV2Helper:
                     pdf_result = r.json()
                     pdf_url = pdf_result.get("data") if isinstance(pdf_result, dict) else None
                     if not pdf_url:
-                        logger.warning("domestic pdf_url is empty, retrying")
+                        logger.warning("domestic pdf_url is empty (response: %s), retrying", pdf_result)
                         continue
 
                     self.query_result = query_result
