@@ -1,9 +1,15 @@
+import json
 import logging
 import random
 import time
 from typing import Any, Optional
 
-import httpx
+from selenium import webdriver
+from selenium.common.exceptions import WebDriverException
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from urllib3.exceptions import NewConnectionError
+from webdriver_manager.chrome import ChromeDriverManager
 
 try:
     from fastapi_app.config import settings
@@ -15,17 +21,9 @@ except ModuleNotFoundError:
 
 logger = logging.getLogger("money")
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
-
 
 class MoneyCheckHelper:
-    base_url = "https://cdcb3.judicial.gov.tw/judbp"
-    v2_url = f"{base_url}/wkw/WHD9A01/V2.htm"
-    query_url = f"{base_url}/wkw/WHD9A01/QUERY.htm"
-    print_url = f"{base_url}/wkw/WHD9A01/PRINT.htm"
+    v2_url = "https://cdcb3.judicial.gov.tw/judbp/wkw/WHD9A01/V2.htm"
     query_titles = {1: "debt", 2: "bankrupt"}
 
     def __init__(self, idnum: str, name: str) -> None:
@@ -34,21 +32,64 @@ class MoneyCheckHelper:
         self.query_result: dict[str, Any] = {}
         self.pdf_result: dict[str, Any] = {}
 
-    def get_form_data(self, query_type: int) -> dict[str, str]:
-        return {
+    def get_params(self, query_type: int) -> str:
+        payload = {
             "queryType": str(query_type),
             "clnm": self.name,
             "idno": self.idnum,
             "sddt_s": "",
             "sddt_e": "",
             "crtid": "",
-            "pageNum": "1",
-            "pageSize": "20",
         }
+        return json.dumps(payload)
 
     @staticmethod
     def get_random_sleep() -> float:
         return round(random.random(), 1)
+
+    @staticmethod
+    def _safe_quit(driver: Optional[webdriver.Chrome]) -> None:
+        if not driver:
+            return
+        try:
+            driver.close()
+        except Exception:
+            pass
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+    def get_driver(self) -> webdriver.Chrome:
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--disable-software-rasterizer")
+        debug_port = random.randint(9222, 9240)
+        chrome_options.add_argument(f"--remote-debugging-port={debug_port}")
+        service = Service(ChromeDriverManager().install())
+        return webdriver.Chrome(service=service, options=chrome_options)
+
+    def get_js(self, params: str, action: str = "QUERY") -> str:
+        return f"""
+        var d = '{params}';
+        var a = JSON.parse(d);
+        var done = arguments[0];
+        formUtil.bindFormData($queryForm, a);
+        $("#pageNum", $queryForm).val(1);
+        $("#pageSize", $queryForm).val(20);
+        formUtil.submitTo({{
+            url: "wkw/WHD9A01/{action}.htm",
+            formObj: $queryForm,
+            async: true,
+            onSuccess: function(responseBean) {{
+                done(responseBean)
+            }}
+        }});
+        return done
+        """
 
     def check(
         self, query_type: int
@@ -57,48 +98,41 @@ class MoneyCheckHelper:
             return RPAQueryStatus.ERROR, None, None, None
 
         for attempt in range(settings.MAX_RETRIES + 1):
+            driver: Optional[webdriver.Chrome] = None
             try:
                 time.sleep(self.get_random_sleep())
-                form_data = self.get_form_data(query_type)
-                with httpx.Client(
-                    follow_redirects=True,
-                    timeout=30.0,
-                    headers={"User-Agent": USER_AGENT},
-                ) as client:
-                    r = client.get(self.v2_url)
-                    r.raise_for_status()
+                driver = self.get_driver()
+                driver.get(self.v2_url)
 
-                    post_headers = {"Referer": self.v2_url, "Origin": self.base_url}
-                    r = client.post(self.query_url, data=form_data, headers=post_headers)
-                    r.raise_for_status()
-                    query_result = r.json()
-                    if not isinstance(query_result, dict):
-                        logger.warning("%s query_result is not dict (got %s), retrying", self.query_titles[query_type], type(query_result).__name__)
-                        continue
+                params = self.get_params(query_type)
+                query_result = driver.execute_async_script(self.get_js(params, "QUERY"))
+                if query_result is None:
+                    logger.warning("%s query_result is None, retrying", self.query_titles[query_type])
+                    continue
 
-                    page_info = query_result.get("pageInfo") or {}
-                    total_num = page_info.get("totalNum") if isinstance(page_info, dict) else None
-                    check_result = (
-                        RPAQueryStatus.NORMAL if total_num == 0 else RPAQueryStatus.ABNORMAL
-                    )
+                page_info = query_result.get("pageInfo", {})
+                total_num = page_info.get("totalNum") if isinstance(page_info, dict) else None
+                check_result = (
+                    RPAQueryStatus.NORMAL if total_num == 0 else RPAQueryStatus.ABNORMAL
+                )
 
-                    time.sleep(settings.CHROME_SLEEP)
-                    r = client.post(self.print_url, data=form_data, headers=post_headers)
-                    r.raise_for_status()
-                    pdf_result = r.json()
-                    pdf_url = pdf_result.get("data") if isinstance(pdf_result, dict) else None
-                    if not pdf_url:
-                        logger.warning("%s pdf_url is empty (response: %s), retrying", self.query_titles[query_type], pdf_result)
-                        continue
+                time.sleep(settings.CHROME_SLEEP)
+                pdf_result = driver.execute_async_script(self.get_js(params, "PRINT"))
+                pdf_url = pdf_result.get("data") if isinstance(pdf_result, dict) else None
+                if not pdf_url:
+                    logger.warning("%s pdf_url is empty, retrying", self.query_titles[query_type])
+                    continue
 
-                    self.query_result = query_result
-                    self.pdf_result = pdf_result
-                    return check_result, total_num, pdf_url, query_result
+                self.query_result = query_result
+                self.pdf_result = pdf_result
+                return check_result, total_num, pdf_url, query_result
 
-            except httpx.HTTPError as exc:
-                logger.warning("%s http error on attempt %s: %s", self.query_titles[query_type], attempt + 1, exc)
+            except (WebDriverException, NewConnectionError) as exc:
+                logger.warning("%s webdriver error on attempt %s: %s", self.query_titles[query_type], attempt + 1, exc)
             except Exception as exc:
                 logger.warning("%s unexpected error on attempt %s: %s", self.query_titles[query_type], attempt + 1, exc)
+            finally:
+                self._safe_quit(driver)
 
         return RPAQueryStatus.ERROR, None, None, None
 
@@ -111,3 +145,4 @@ class MoneyCheckHelper:
         self,
     ) -> tuple[RPAQueryStatus, Optional[int], Optional[str], Optional[dict[str, Any]]]:
         return self.check(2)
+
