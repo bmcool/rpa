@@ -22,3 +22,10 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local data artifacts
+list.csv
+pdfs/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

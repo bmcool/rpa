@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 selenium
 webdriver-manager
+httpx
