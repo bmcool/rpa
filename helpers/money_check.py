@@ -68,7 +68,8 @@ class MoneyCheckHelper:
                     r = client.get(self.v2_url)
                     r.raise_for_status()
 
-                    r = client.post(self.query_url, data=form_data)
+                    post_headers = {"Referer": self.v2_url, "Origin": self.base_url}
+                    r = client.post(self.query_url, data=form_data, headers=post_headers)
                     r.raise_for_status()
                     query_result = r.json()
                     if not isinstance(query_result, dict):
@@ -82,7 +83,7 @@ class MoneyCheckHelper:
                     )
 
                     time.sleep(settings.CHROME_SLEEP)
-                    r = client.post(self.print_url, data=form_data)
+                    r = client.post(self.print_url, data=form_data, headers=post_headers)
                     r.raise_for_status()
                     pdf_result = r.json()
                     pdf_url = pdf_result.get("data") if isinstance(pdf_result, dict) else None

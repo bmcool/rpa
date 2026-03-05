@@ -58,7 +58,8 @@ class DomesticJudV2Helper:
                         "pageNum": "1",
                         "pageSize": "20",
                     }
-                    r = client.post(self.query_url, data=query_form)
+                    post_headers = {"Referer": self.v2_url, "Origin": self.base_url}
+                    r = client.post(self.query_url, data=query_form, headers=post_headers)
                     r.raise_for_status()
                     query_result = r.json()
                     if not isinstance(query_result, dict):
@@ -72,7 +73,7 @@ class DomesticJudV2Helper:
                     )
 
                     time.sleep(settings.CHROME_SLEEP)
-                    r = client.post(self.print_url, data=query_form)
+                    r = client.post(self.print_url, data=query_form, headers=post_headers)
                     r.raise_for_status()
                     pdf_result = r.json()
                     pdf_url = pdf_result.get("data") if isinstance(pdf_result, dict) else None
