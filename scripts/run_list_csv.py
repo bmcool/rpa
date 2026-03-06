@@ -1,33 +1,42 @@
 #!/usr/bin/env python3
 """
-家消破批次腳本 (SQLite 版)
+家消破批次腳本 (SQLite 版，直接呼叫 helper)
 
 功能:
 - 從 CSV 讀取 Name / NationalId
-- 每筆打三支 API: domestic / debt / bankrupt
+- 每筆查詢家 / 消 / 破三類資料
 - 執行過程持續寫入 SQLite，支援隨時中斷
+- 下載三類 PDF，檔案存在且非空才算成功
 - 可指定 concurrency 與本次處理筆數
 - 可續跑 (已完成者自動跳過)
+- 可持續回合重跑，直到全部成功或手動停止
 """
 import argparse
 import asyncio
 import csv
 import json
+import os
+import signal
 import sqlite3
+import subprocess
+import sys
+import threading
 import time
+import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-import httpx
+WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+if str(WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_ROOT))
 
-DEFAULT_BASE_URL = "http://127.0.0.1:8000"
+from helpers import DomesticJudV2Helper, MoneyCheckHelper, RPAQueryStatus
+
 DEFAULT_INPUT = "list.csv"
 DEFAULT_DB = "results_household_debt_bankrupt.sqlite"
-ENDPOINTS = {
-    "domestic": "/domestic-jud",
-    "debt": "/debt-jud",
-    "bankrupt": "/bankrupt-jud",
-}
+QUERY_NAMES = ("domestic", "debt", "bankrupt")
+STOP_EVENT = threading.Event()
+SIGNAL_COUNT = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,18 +44,96 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", default=DEFAULT_INPUT, help="CSV 路徑 (預設: list.csv)")
     parser.add_argument("--db-path", default=DEFAULT_DB, help="SQLite 結果檔路徑")
     parser.add_argument("--pdf-dir", default="pdfs", help="PDF 下載目錄")
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="API base URL")
     parser.add_argument("--concurrency", "-c", type=int, default=3, help="並發數")
     parser.add_argument(
         "--limit",
         "-n",
         type=int,
         default=None,
-        help="本次最多處理筆數 (未指定則處理所有未完成)",
+        help="每回合最多處理筆數 (未指定則處理所有未完成)",
     )
-    parser.add_argument("--timeout", type=float, default=120.0, help="每次請求 timeout 秒數")
-    parser.add_argument("--retry", type=int, default=1, help="失敗重試次數 (不含首次)")
+    parser.add_argument("--timeout", type=float, default=120.0, help="PDF 下載 timeout 秒數")
+    parser.add_argument("--retry", type=int, default=1, help="單類查詢失敗重試次數 (不含首次)")
+    parser.add_argument(
+        "--round-interval",
+        type=float,
+        default=1.0,
+        help="每回合結束後等待秒數，避免連續重打過快",
+    )
     return parser.parse_args()
+
+
+def find_descendant_pids(root_pid: int) -> set[int]:
+    raw = subprocess.check_output(["ps", "-axo", "pid,ppid"], text=True)
+    parents: dict[int, list[int]] = {}
+    for line in raw.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        pid = int(parts[0])
+        ppid = int(parts[1])
+        parents.setdefault(ppid, []).append(pid)
+
+    descendants: set[int] = set()
+    stack = [root_pid]
+    while stack:
+        current = stack.pop()
+        for child in parents.get(current, []):
+            if child in descendants:
+                continue
+            descendants.add(child)
+            stack.append(child)
+    return descendants
+
+
+def cleanup_webdriver_processes() -> None:
+    try:
+        descendants = find_descendant_pids(os.getpid())
+    except Exception:
+        descendants = set()
+    if not descendants:
+        return
+
+    detail_raw = subprocess.check_output(["ps", "-axo", "pid,command"], text=True)
+    kill_targets: list[int] = []
+    for line in detail_raw.splitlines()[1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(maxsplit=1)
+        if len(parts) < 2:
+            continue
+        pid = int(parts[0])
+        cmd = parts[1]
+        if pid not in descendants:
+            continue
+        if "chromedriver" in cmd or ("Google Chrome" in cmd and "--remote-debugging-port=" in cmd):
+            kill_targets.append(pid)
+
+    for pid in kill_targets:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            pass
+
+
+def handle_signal(sig: int, _frame: Any) -> None:
+    global SIGNAL_COUNT
+    SIGNAL_COUNT += 1
+    STOP_EVENT.set()
+    if SIGNAL_COUNT == 1:
+        print(f"\n收到中斷訊號({sig})，停止接新工作，等待目前任務收尾中...")
+        return
+    print(f"\n收到第二次中斷訊號({sig})，強制終止並清理 webdriver 子程序。")
+    cleanup_webdriver_processes()
+    os._exit(130)
+
+
+def install_signal_handlers() -> None:
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
 
 
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
@@ -71,8 +158,15 @@ def open_db(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, sql_type: str) -> None:
+    rows = conn.execute(f"PRAGMA table_info({table}_results)").fetchall()
+    exists = any(row[1] == column for row in rows)
+    if not exists:
+        conn.execute(f"ALTER TABLE {table}_results ADD COLUMN {column} {sql_type}")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
-    for table in ENDPOINTS:
+    for table in QUERY_NAMES:
         conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {table}_results (
@@ -94,20 +188,6 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def ensure_column(conn: sqlite3.Connection, table: str, column: str, sql_type: str) -> None:
-    rows = conn.execute(f"PRAGMA table_info({table}_results)").fetchall()
-    exists = any(row[1] == column for row in rows)
-    if not exists:
-        conn.execute(f"ALTER TABLE {table}_results ADD COLUMN {column} {sql_type}")
-
-
-def get_completed_ids(conn: sqlite3.Connection) -> set[str]:
-    domestic_ids = get_table_valid_ids(conn, "domestic")
-    debt_ids = get_table_valid_ids(conn, "debt")
-    bankrupt_ids = get_table_valid_ids(conn, "bankrupt")
-    return domestic_ids & debt_ids & bankrupt_ids
-
-
 def get_table_valid_ids(conn: sqlite3.Connection, table: str) -> set[str]:
     rows = conn.execute(
         f"""
@@ -126,22 +206,27 @@ def get_table_valid_ids(conn: sqlite3.Connection, table: str) -> set[str]:
     return valid_ids
 
 
-async def download_pdf(
-    client: httpx.AsyncClient,
+def get_completed_ids(conn: sqlite3.Connection) -> set[str]:
+    domestic_ids = get_table_valid_ids(conn, "domestic")
+    debt_ids = get_table_valid_ids(conn, "debt")
+    bankrupt_ids = get_table_valid_ids(conn, "bankrupt")
+    return domestic_ids & debt_ids & bankrupt_ids
+
+
+def download_pdf(
     pdf_url: str,
     pdf_dir: Path,
     national_id: str,
-    cache_name: str,
+    query_name: str,
     timeout: float,
 ) -> Path:
-    resp = await client.get(pdf_url, timeout=timeout, follow_redirects=True)
-    if not (200 <= resp.status_code < 300):
-        raise ValueError(f"PDF 下載失敗 HTTP {resp.status_code}")
-    content = resp.content
+    req = urllib.request.Request(pdf_url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        content = response.read()
     if not content:
         raise ValueError("PDF 內容為空")
 
-    endpoint_dir = pdf_dir / cache_name
+    endpoint_dir = pdf_dir / query_name
     endpoint_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = endpoint_dir / f"{national_id}.pdf"
     pdf_path.write_bytes(content)
@@ -150,11 +235,114 @@ async def download_pdf(
     return pdf_path
 
 
+def build_query_response(
+    status: RPAQueryStatus,
+    total_num: Any,
+    pdf_url: Any,
+    raw_result: Any,
+) -> dict[str, Any]:
+    if status == RPAQueryStatus.NORMAL:
+        message = "Query completed: normal"
+    elif status == RPAQueryStatus.ABNORMAL:
+        message = "Query completed: abnormal"
+    else:
+        message = "Query failed"
+
+    return {
+        "status": status.value,
+        "message": message,
+        "total_num": total_num,
+        "pdf_url": pdf_url,
+        "raw_result": raw_result,
+    }
+
+
+def query_direct_once(
+    query_name: str,
+    name: str,
+    national_id: str,
+    pdf_dir: Path,
+    timeout: float,
+) -> dict[str, Any]:
+    if STOP_EVENT.is_set():
+        raise RuntimeError("stop requested")
+    start = time.perf_counter()
+    helper_call: Callable[[], tuple[RPAQueryStatus, Any, Any, Any]]
+    if query_name == "domestic":
+        helper = DomesticJudV2Helper(idnum=national_id, name=name)
+        helper_call = helper.get_n_check_data
+    elif query_name == "debt":
+        helper = MoneyCheckHelper(idnum=national_id, name=name)
+        helper_call = helper.check_debt
+    else:
+        helper = MoneyCheckHelper(idnum=national_id, name=name)
+        helper_call = helper.check_bankrupt
+
+    status, total_num, pdf_url, raw_result = helper_call()
+    body = build_query_response(status, total_num, pdf_url, raw_result)
+    if status not in {RPAQueryStatus.NORMAL, RPAQueryStatus.ABNORMAL}:
+        raise ValueError(f"status 非成功狀態: {status.value}")
+    if not isinstance(pdf_url, str) or not pdf_url.strip():
+        raise ValueError("缺少 pdf_url")
+    if not isinstance(total_num, int):
+        raise ValueError("total_num 不完整")
+    if not isinstance(raw_result, dict):
+        raise ValueError("raw_result 不完整")
+
+    pdf_path = download_pdf(pdf_url, pdf_dir, national_id, query_name, timeout)
+    elapsed = round(time.perf_counter() - start, 3)
+    return {
+        "ok": True,
+        "status_code": None,
+        "elapsed_sec": elapsed,
+        "response": body,
+        "pdf_url": pdf_url,
+        "pdf_path": str(pdf_path),
+    }
+
+
+def call_one_query_with_retry(
+    query_name: str,
+    name: str,
+    national_id: str,
+    pdf_dir: Path,
+    timeout: float,
+    retry: int,
+) -> dict[str, Any]:
+    attempts = retry + 1
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        if STOP_EVENT.is_set():
+            return {
+                "ok": False,
+                "status_code": None,
+                "elapsed_sec": None,
+                "attempt": attempt,
+                "error": "stop requested",
+            }
+        try:
+            result = query_direct_once(query_name, name, national_id, pdf_dir, timeout)
+            result["attempt"] = attempt
+            return result
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}".strip()
+            if attempt == attempts:
+                return {
+                    "ok": False,
+                    "status_code": None,
+                    "elapsed_sec": None,
+                    "attempt": attempt,
+                    "error": last_error,
+                }
+            time.sleep(min(0.5 * attempt, 2.0))
+    return {"ok": False, "status_code": None, "error": last_error}
+
+
 def upsert_person_results(
     conn: sqlite3.Connection, national_id: str, person_results: dict[str, dict[str, Any]]
 ) -> bool:
     all_ok = True
-    for table in ("domestic", "debt", "bankrupt"):
+    for table in QUERY_NAMES:
         item = person_results[table]
         response = item["response"]
         ok = bool(response.get("ok"))
@@ -192,110 +380,36 @@ def upsert_person_results(
     return all_ok
 
 
-async def call_one_endpoint(
-    client: httpx.AsyncClient,
-    cache_name: str,
-    base_url: str,
-    endpoint: str,
-    payload: dict[str, str],
-    national_id: str,
-    pdf_dir: Path,
-    timeout: float,
-    retry: int,
-) -> dict[str, Any]:
-    url = base_url.rstrip("/") + endpoint
-    attempts = retry + 1
-    last_error = ""
-    for attempt in range(1, attempts + 1):
-        resp: httpx.Response | None = None
-        start = time.perf_counter()
-        try:
-            resp = await client.post(url, json=payload, timeout=timeout)
-            elapsed = round(time.perf_counter() - start, 3)
-            body: Any
-            try:
-                body = resp.json()
-            except Exception:
-                body = resp.text
-            if not isinstance(body, dict):
-                raise ValueError("API 回傳非 JSON 物件")
-            if not (200 <= resp.status_code < 300):
-                raise ValueError(f"HTTP {resp.status_code}")
-            status = body.get("status")
-            pdf_url = body.get("pdf_url")
-            total_num = body.get("total_num")
-            raw_result = body.get("raw_result")
-            if status not in {"Y", "N"}:
-                raise ValueError(f"status 非成功狀態: {status!r}")
-            if not isinstance(pdf_url, str) or not pdf_url.strip():
-                raise ValueError("缺少 pdf_url")
-            if not isinstance(total_num, int):
-                raise ValueError("total_num 不完整")
-            if not isinstance(raw_result, dict):
-                raise ValueError("raw_result 不完整")
-
-            pdf_path = await download_pdf(client, pdf_url, pdf_dir, national_id, cache_name, timeout)
-            return {
-                "ok": True,
-                "status_code": resp.status_code,
-                "elapsed_sec": elapsed,
-                "attempt": attempt,
-                "response": body,
-                "pdf_url": pdf_url,
-                "pdf_path": str(pdf_path),
-            }
-        except Exception as exc:
-            elapsed = round(time.perf_counter() - start, 3)
-            last_error = f"{type(exc).__name__}: {exc}".strip()
-            if attempt == attempts:
-                return {
-                    "ok": False,
-                    "status_code": resp.status_code if resp is not None else None,
-                    "elapsed_sec": elapsed,
-                    "attempt": attempt,
-                    "error": last_error,
-                }
-            await asyncio.sleep(min(0.5 * attempt, 2.0))
-
-    return {"ok": False, "status_code": None, "error": last_error}
-
-
 async def process_person(
-    client: httpx.AsyncClient,
     sem: asyncio.Semaphore,
     person: dict[str, str],
-    base_url: str,
     pdf_dir: Path,
     timeout: float,
     retry: int,
 ) -> tuple[str, dict[str, dict[str, Any]]]:
     national_id = person["national_id"]
     name = person["name"]
-    payload = {"ino": national_id, "name": name}
-
     async with sem:
         tasks = {
-            cache_name: asyncio.create_task(
-                call_one_endpoint(
-                    client=client,
-                    cache_name=cache_name,
-                    base_url=base_url,
-                    endpoint=endpoint,
-                    payload=payload,
-                    national_id=national_id,
-                    pdf_dir=pdf_dir,
-                    timeout=timeout,
-                    retry=retry,
+            query_name: asyncio.create_task(
+                asyncio.to_thread(
+                    call_one_query_with_retry,
+                    query_name,
+                    name,
+                    national_id,
+                    pdf_dir,
+                    timeout,
+                    retry,
                 )
             )
-            for cache_name, endpoint in ENDPOINTS.items()
+            for query_name in QUERY_NAMES
         }
-        endpoint_results = {cache_name: await task for cache_name, task in tasks.items()}
+        query_results = {query_name: await task for query_name, task in tasks.items()}
 
     merged: dict[str, dict[str, Any]] = {}
     now = int(time.time())
-    for cache_name, result in endpoint_results.items():
-        merged[cache_name] = {
+    for query_name, result in query_results.items():
+        merged[query_name] = {
             "name": name,
             "response": result,
             "updated_at": now,
@@ -305,7 +419,6 @@ async def process_person(
 
 async def run_batch_and_persist(
     people: list[dict[str, str]],
-    base_url: str,
     pdf_dir: Path,
     concurrency: int,
     timeout: float,
@@ -315,24 +428,38 @@ async def run_batch_and_persist(
     sem = asyncio.Semaphore(concurrency)
     processed_count = 0
     success_count = 0
-
-    async with httpx.AsyncClient() as client:
-        tasks = [
+    tasks = [
+        asyncio.create_task(
             process_person(
-                client, sem, person, base_url=base_url, pdf_dir=pdf_dir, timeout=timeout, retry=retry
+                sem=sem,
+                person=person,
+                pdf_dir=pdf_dir,
+                timeout=timeout,
+                retry=retry,
             )
-            for person in people
-        ]
-        for fut in asyncio.as_completed(tasks):
-            national_id, per_person = await fut
-            person_ok = upsert_person_results(conn, national_id, per_person)
-            processed_count += 1
-            if person_ok:
-                success_count += 1
+        )
+        for person in people
+    ]
+    for fut in asyncio.as_completed(tasks):
+        if STOP_EVENT.is_set():
+            break
+        national_id, per_person = await fut
+        person_ok = upsert_person_results(conn, national_id, per_person)
+        processed_count += 1
+        if person_ok:
+            success_count += 1
+
+    # Stop requested: cancel remaining coroutine tasks promptly.
+    if STOP_EVENT.is_set():
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     return processed_count, success_count
 
 
 def main() -> None:
+    install_signal_handlers()
     args = parse_args()
     if args.concurrency <= 0:
         raise ValueError("--concurrency 必須 > 0")
@@ -340,6 +467,8 @@ def main() -> None:
         raise ValueError("--limit 必須 > 0")
     if args.retry < 0:
         raise ValueError("--retry 不能小於 0")
+    if args.round_interval < 0:
+        raise ValueError("--round-interval 不能小於 0")
 
     input_path = Path(args.input)
     db_path = Path(args.db_path)
@@ -355,43 +484,54 @@ def main() -> None:
 
     conn = open_db(db_path)
     init_db(conn)
-    completed = get_completed_ids(conn)
-    pending_rows = [r for r in all_rows if r["national_id"] not in completed]
-    if args.limit:
-        pending_rows = pending_rows[: args.limit]
-
-    print(
-        f"總筆數={len(all_rows)}, 已完成={len(completed)}, "
-        f"本次處理={len(pending_rows)}, concurrency={args.concurrency}"
-    )
-    if not pending_rows:
-        print("沒有需要處理的新資料。")
-        conn.close()
-        return
-
     started_at = time.perf_counter()
-    success_count = 0
-    processed_count = 0
+    total_processed = 0
+    total_success = 0
+    round_no = 0
     try:
-        processed_count, success_count = asyncio.run(
-            run_batch_and_persist(
-                people=pending_rows,
-                base_url=args.base_url,
-                pdf_dir=pdf_dir,
-                concurrency=args.concurrency,
-                timeout=args.timeout,
-                retry=args.retry,
-                conn=conn,
+        while True:
+            if STOP_EVENT.is_set():
+                print("停止旗標已啟用，結束主迴圈。")
+                break
+            round_no += 1
+            completed = get_completed_ids(conn)
+            pending_rows = [r for r in all_rows if r["national_id"] not in completed]
+            if args.limit:
+                pending_rows = pending_rows[: args.limit]
+
+            print(
+                f"[Round {round_no}] 總筆數={len(all_rows)}, 已完成={len(completed)}, "
+                f"本回合處理={len(pending_rows)}, concurrency={args.concurrency}"
             )
-        )
-    except KeyboardInterrupt:
-        print("偵測到中斷，已保存目前完成的資料，可直接續跑。")
+            if not pending_rows:
+                print("全部成功完成，結束。")
+                break
+
+            processed_count, success_count = asyncio.run(
+                run_batch_and_persist(
+                    people=pending_rows,
+                    pdf_dir=pdf_dir,
+                    concurrency=args.concurrency,
+                    timeout=args.timeout,
+                    retry=args.retry,
+                    conn=conn,
+                )
+            )
+            total_processed += processed_count
+            total_success += success_count
+
+            if STOP_EVENT.is_set():
+                print("已停止接新工作，準備結束。")
+                break
+            if args.round_interval > 0:
+                time.sleep(args.round_interval)
     finally:
+        if STOP_EVENT.is_set():
+            cleanup_webdriver_processes()
         conn.close()
 
     elapsed = time.perf_counter() - started_at
-
-    print(f"完成，耗時 {elapsed:.1f}s。完整成功 {success_count}/{processed_count} 筆。")
+    print(f"完成，耗時 {elapsed:.1f}s。累計回合成功 {total_success}/{total_processed} 筆。")
     print(f"結果已寫入 SQLite: {db_path}")
 
 

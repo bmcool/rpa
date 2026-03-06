@@ -1,0 +1,31 @@
+services:
+  selenium:
+    image: ${SELENIUM_IMAGE:-selenium/standalone-chromium:latest}
+    shm_size: "2gb"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:4444/wd/hub/status | grep -Eq '\"ready\"[[:space:]]*:[[:space:]]*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      selenium:
+        condition: service_healthy
+    environment:
+      SELENIUM_REMOTE_URL: http://selenium:4444/wd/hub
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./:/app
+    working_dir: /app
+    command:
+      - --input
+      - /app/list.csv
+      - --db-path
+      - /app/results_household_debt_bankrupt.sqlite
+      - --pdf-dir
+      - /app/pdfs

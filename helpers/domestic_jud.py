@@ -7,14 +7,11 @@ from selenium import webdriver
 from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.remote.webdriver import WebDriver
 from urllib3.exceptions import NewConnectionError
 
-try:
-    from fastapi_app.config import settings
-    from fastapi_app.helpers.constants import RPAQueryStatus
-except ModuleNotFoundError:
-    from config import settings
-    from helpers.constants import RPAQueryStatus
+from config import settings
+from helpers.constants import RPAQueryStatus
 
 
 logger = logging.getLogger("domestic")
@@ -58,17 +55,23 @@ class DomesticJudV2Helper:
         self.query_result: dict[str, Any] = {}
         self.pdf_result: dict[str, Any] = {}
 
-    def get_driver(self) -> webdriver.Chrome:
+    def get_driver(self) -> WebDriver:
         chrome_options = Options()
         chrome_options.add_argument("--headless")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
+        if settings.SELENIUM_REMOTE_URL:
+            return webdriver.Remote(
+                command_executor=settings.SELENIUM_REMOTE_URL,
+                options=chrome_options,
+            )
+
         debug_port = random.randint(9222, 9240)
         chrome_options.add_argument(f"--remote-debugging-port={debug_port}")
         return webdriver.Chrome(options=chrome_options)
 
     @staticmethod
-    def _safe_quit(driver: Optional[webdriver.Chrome]) -> None:
+    def _safe_quit(driver: Optional[WebDriver]) -> None:
         if not driver:
             return
         try:
@@ -83,7 +86,7 @@ class DomesticJudV2Helper:
 
     def get_n_check_data(self) -> tuple[RPAQueryStatus, Optional[int], Optional[str], Optional[dict[str, Any]]]:
         for attempt in range(settings.MAX_RETRIES + 1):
-            driver: Optional[webdriver.Chrome] = None
+            driver: Optional[WebDriver] = None
             try:
                 time.sleep(self.get_random_sleep())
                 driver = self.get_driver()

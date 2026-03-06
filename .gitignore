@@ -29,3 +29,5 @@ pdfs/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+.tmp_*/
+pdfs.zip
